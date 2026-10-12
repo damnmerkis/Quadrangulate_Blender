@@ -1,0 +1,172 @@
+import bpy
+import bmesh
+from mathutils import Vector
+
+# ==========================================
+# SETTINGS
+# ==========================================
+# 0.95 = общее ребро должно быть почти самым
+# длинным ребром в обоих соседних треугольниках.
+DIAGONAL_RATIO = 0.95
+
+# Максимальный угол между нормалями соседних
+# треугольников. Увеличивай для изогнутых поверхностей.
+MAX_NORMAL_ANGLE = 20.0
+
+# True = не растворять рёбра, если треугольники
+# заметно неплоские относительно друг друга.
+CHECK_NORMALS = True
+
+# ==========================================
+# VALIDATE
+# ==========================================
+obj = bpy.context.active_object
+if obj is None or obj.type != 'MESH':
+    raise RuntimeError("Выбери Mesh-объект.")
+
+if bpy.context.mode != 'OBJECT':
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+bm = bmesh.new()
+bm.from_mesh(obj.data)
+bm.normal_update()
+
+before_verts = len(bm.verts)
+before_faces = len(bm.faces)
+
+wm = bpy.context.window_manager
+
+# ==========================================
+# FIND TRIANGLE DIAGONALS
+# ==========================================
+edges = list(bm.edges)
+total_edges = len(edges)
+
+wm.progress_begin(0, 100)
+wm.progress_update(0)
+
+candidates = []
+for i, edge in enumerate(edges):
+    # Обновляем прогресс каждые 50 рёбер (или на последнем)
+    if i % 50 == 0 or i == total_edges - 1:
+        percent = int((i / total_edges) * 50)  # первая половина = поиск
+        wm.progress_update(percent)
+
+    if not edge.is_valid:
+        continue
+
+    # Только внутренние рёбра между двумя треугольниками
+    if len(edge.link_faces) != 2:
+        continue
+
+    f1, f2 = edge.link_faces
+    if len(f1.verts) != 3 or len(f2.verts) != 3:
+        continue
+
+    # Не обрабатываем разрывы и острые складки
+    if CHECK_NORMALS:
+        angle = f1.normal.angle(f2.normal)
+        if angle > MAX_NORMAL_ANGLE * 0.01745329252:
+            continue
+
+    shared_length = edge.calc_length()
+
+    # Сравниваем общую сторону с остальными сторонами
+    # каждого из двух треугольников.
+    def other_edge_lengths(face, shared_edge):
+        return [
+            e.calc_length()
+            for e in face.edges
+            if e != shared_edge
+        ]
+
+    lengths1 = other_edge_lengths(f1, edge)
+    lengths2 = other_edge_lengths(f2, edge)
+
+    if not lengths1 or not lengths2:
+        continue
+
+    # Диагональ обычно длиннее сторон исходного квадрата.
+    # Она должна быть близка к самой длинной стороне
+    # в обоих треугольниках.
+    if shared_length < max(lengths1) * DIAGONAL_RATIO:
+        continue
+    if shared_length < max(lengths2) * DIAGONAL_RATIO:
+        continue
+
+    # Приоритет отдаём наиболее вероятным диагоналям
+    score = (
+        shared_length / max(lengths1)
+        + shared_length / max(lengths2)
+    ) / 2.0
+
+    candidates.append((score, edge))
+
+# Сначала рассматриваем наиболее вероятные диагонали
+candidates.sort(key=lambda item: item[0], reverse=True)
+
+# ==========================================
+# DISSOLVE
+# ==========================================
+total_candidates = len(candidates)
+dissolved = 0
+
+for i, (score, edge) in enumerate(candidates):
+    # Обновляем прогресс (вторая половина = 50–100%)
+    if i % 20 == 0 or i == total_candidates - 1:
+        if total_candidates > 0:
+            percent = 50 + int((i / total_candidates) * 50)
+        else:
+            percent = 100
+        wm.progress_update(percent)
+
+    if not edge.is_valid:
+        continue
+
+    # После предыдущих операций соседние полигоны
+    # могли измениться — проверяем всё повторно.
+    if len(edge.link_faces) != 2:
+        continue
+
+    f1, f2 = edge.link_faces
+    if len(f1.verts) != 3 or len(f2.verts) != 3:
+        continue
+
+    # Объединение двух треугольников удалением ребра
+    result = bmesh.ops.dissolve_edges(
+        bm,
+        edges=[edge],
+        use_verts=False,
+        use_face_split=False
+    )
+    dissolved += 1
+
+wm.progress_update(100)
+wm.progress_end()
+
+# ==========================================
+# WRITE BACK
+# ==========================================
+bm.normal_update()
+bm.to_mesh(obj.data)
+obj.data.update()
+bm.free()
+
+# ==========================================
+# REPORT
+# ==========================================
+mesh = obj.data
+quads = sum(len(p.vertices) == 4 for p in mesh.polygons)
+tris = sum(len(p.vertices) == 3 for p in mesh.polygons)
+ngons = sum(len(p.vertices) > 4 for p in mesh.polygons)
+
+print("===== QUAD RESTORE =====")
+print(f"Vertices before: {before_verts}")
+print(f"Vertices after:  {len(mesh.vertices)}")
+print(f"Faces before:    {before_faces}")
+print(f"Faces after:     {len(mesh.polygons)}")
+print(f"Edges dissolved: {dissolved}")
+print(f"Quads:           {quads}")
+print(f"Triangles left:  {tris}")
+print(f"N-gons:          {ngons}")
+print("========================")
